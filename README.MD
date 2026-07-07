@@ -1,6 +1,7 @@
 GerRepair SPD Raw Dumper - Alpha Anpassung
 ==========================================
 
+OS: Windows 10 64Bit
 
 Start:
   py -3 SPD_Read_GerRepair_Alpha.py
