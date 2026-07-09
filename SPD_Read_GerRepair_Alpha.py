@@ -6,7 +6,8 @@ spd_dump_gui.py  -  DDR4 SPD-EEPROM Dumper mit GUI (Windows, Intel + AMD)
 
 Liest den kompletten 512-Byte SPD-EEPROM (JEDEC + XMP) jedes bestueckten
 DDR4-Moduls ueber den SMBus aus, speichert ihn als .bin und zeigt einen
-Decode direkt im Log-Fenster an.
+Decode direkt im Log-Fenster an. Optional kann eine 512-Byte-BIN-Datei nach
+mehrfacher Warnung auf ein ausgewaehltes DDR4-SPD-EEPROM geschrieben werden.
 
 TREIBER (einer davon reicht, im Script-Ordner):
   * inpoutx64.dll   -> installiert seinen Kernel-Treiber selbst (steckt in der
@@ -45,14 +46,27 @@ APP_TITLE = f"{APP_NAME} - {APP_VERSION}"
 ALPHA_DISCLAIMER = (
     "ALPHA-VERSION\n\n"
     "Die Nutzung erfolgt auf eigene Verantwortung.\n\n"
-    "Aktueller Stand: Diese Version ist nur zum Lesen/Dumpen von DDR4-SPD-Daten "
-    "gedacht. Es werden keine SPD-Daten geschrieben.\n\n"
-    "Hinweis: Bei Zeiten kann eventuell eine Schreibfunktion hinzukommen. "
-    "Das Schreiben von SPD-Daten kann RAM-Module unbrauchbar machen und wird "
-    "daher nur mit gesonderten Sicherheitsabfragen umgesetzt.\n\n"
+    "Dieses Tool kann DDR4-SPD-Daten lesen und experimentell auch eine 512-Byte-"
+    "BIN-Datei auf das SPD-EEPROM schreiben. Schreibzugriffe sind gefaehrlich "
+    "und koennen ein RAM-Modul unbrauchbar machen.\n\n"
+    "Vor jedem Schreibvorgang legt das Programm zwingend einen Backup-Dump an. "
+    "Im Ernstfall muss der EEPROM auf dem RAM-Modul eventuell mit einem "
+    "externen Hardware-Flasher neu beschrieben werden. Nutzung auf eigene Gefahr.\n\n"
     "Bitte vor dem Start andere Sensor-, RGB- und Monitoring-Tools schliessen "
     "(z.B. HWiNFO, Ryzen Master, ZenTimings, OpenRGB, AIDA64, CPU-Z-Sensoren)."
 )
+
+WRITE_WARNING = (
+    "WARNUNG: SPD-EEPROM SCHREIBEN\n\n"
+    "Diese Funktion schreibt eine .bin-Datei direkt auf den EEPROM des RAM-Moduls.\n\n"
+    "Das kann den RAM unbrauchbar machen. Wenn der Inhalt falsch ist oder der "
+    "Schreibvorgang abbricht, startet das System eventuell nicht mehr mit diesem "
+    "Modul. Im Ernstfall muss der EEPROM auf dem RAM-Modul mit einem externen "
+    "Hardware-Flasher beschrieben werden.\n\n"
+    "Das Programm legt vorher zwingend einen Backup-Dump an. Trotzdem: Nutzung "
+    "auf eigene Gefahr."
+)
+
 
 GERREPAIR_LOGO_PNG_BASE64 = """
 iVBORw0KGgoAAAANSUhEUgAAAFgAAABYCAYAAABxlTA0AAAhi0lEQVR42u18aVBVV7r2s/cZmWRW
@@ -583,6 +597,25 @@ class SMBus:
             return None
         return self.drv.inb(self.r_dat0)
 
+    def write_data_byte(self, dimm_addr, offset, value, retries=2):
+        # SMBus Byte-Data Write: Adresse + Offset(Command) + Datenbyte.
+        # Das schreibt echte SPD-EEPROM-Daten, wenn der EEPROM nicht
+        # hardware-/softwareseitig write-protected ist.
+        for _ in range(retries + 1):
+            if not self._wait_free():
+                self._clear()
+            self._clear()
+            self.drv.outb(self.r_add, (dimm_addr << 1) | 0)
+            self.drv.outb(self.r_cmd, offset & 0xFF)
+            self.drv.outb(self.r_dat0, value & 0xFF)
+            if self._transaction(self.PROTO_BYTE_DATA):
+                # EEPROM interner Write-Cycle. Ohne Pause liefert Verify oft
+                # noch den alten Wert oder der naechste Zugriff stoert.
+                time.sleep(0.012)
+                return True
+            time.sleep(0.012)
+        return False
+
     def send_byte(self, dev_addr, value=0x00):
         if not self._wait_free():
             return False
@@ -621,6 +654,77 @@ def read_spd(smbus, addr, log=None):
     smbus.set_page(0)
     return bytes(data)
 
+
+def crc16_xmodem(data):
+    crc = 0
+    for b in data:
+        crc ^= (b << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def ddr4_crc_status(spd):
+    if len(spd) != 512:
+        return False, "Dateigroesse ist %d Byte, erwartet 512 Byte." % len(spd)
+    if spd[2] != 0x0C:
+        return False, "Byte 2 ist 0x%02X, erwartet 0x0C fuer DDR4." % spd[2]
+    base_want = spd[126] | (spd[127] << 8)
+    base_got = crc16_xmodem(spd[0:126])
+    ext_want = spd[254] | (spd[255] << 8)
+    ext_got = crc16_xmodem(spd[128:254])
+    ok = (base_want == base_got and ext_want == ext_got)
+    msg = ("Base CRC %s (SPD=0x%04X, calc=0x%04X); Ext CRC %s "
+           "(SPD=0x%04X, calc=0x%04X)" %
+           ("OK" if base_want == base_got else "FEHLER", base_want, base_got,
+            "OK" if ext_want == ext_got else "FEHLER", ext_want, ext_got))
+    return ok, msg
+
+
+def write_spd_image(smbus, addr, image, log=None):
+    if len(image) != 512:
+        raise RuntimeError("Die BIN-Datei muss exakt 512 Byte gross sein.")
+    crc_ok, crc_msg = ddr4_crc_status(image)
+    if not crc_ok:
+        raise RuntimeError("Die BIN-Datei wird nicht geschrieben, weil die "
+                           "DDR4-CRC/Plausibilitaet nicht OK ist: " + crc_msg)
+
+    written = 0
+    skipped = 0
+    for page in (0, 1):
+        if log:
+            log("  schreibe Seite %d ..." % page)
+        smbus.set_page(page)
+        time.sleep(0.002)
+        for i in range(256):
+            absolute = page * 256 + i
+            target = image[absolute]
+            current = smbus.read_byte(addr, i)
+            if current == target:
+                skipped += 1
+                continue
+            if not smbus.write_data_byte(addr, i, target):
+                raise RuntimeError("Schreiben fehlgeschlagen bei Byte 0x%03X." % absolute)
+            verify = None
+            for _ in range(5):
+                verify = smbus.read_byte(addr, i)
+                if verify == target:
+                    break
+                time.sleep(0.010)
+            if verify != target:
+                got = "None" if verify is None else "0x%02X" % verify
+                raise RuntimeError("Verify fehlgeschlagen bei Byte 0x%03X: "
+                                   "soll 0x%02X, gelesen %s. EEPROM ist "
+                                   "moeglicherweise write-protected." %
+                                   (absolute, target, got))
+            written += 1
+            if log and (written % 16 == 0):
+                log("    %d Byte geschrieben ..." % written)
+    smbus.set_page(0)
+    return written, skipped
 
 # ==========================================================================
 #  DDR4 Decoder
@@ -765,6 +869,110 @@ def dump_worker(cfg, logq, done_cb):
         done_cb()
 
 
+
+def write_worker(cfg, logq, done_cb):
+    def log(msg):
+        logq.put(msg)
+
+    drv = None
+    try:
+        addr = cfg["addr"]
+        if addr is None:
+            raise RuntimeError("Beim Schreiben muss eine einzelne DIMM-Adresse angegeben sein, z.B. 0x50 oder 0x51.")
+
+        image_path = cfg["write_file"]
+        with open(image_path, "rb") as f:
+            image = f.read()
+        crc_ok, crc_msg = ddr4_crc_status(image)
+        log("BIN-Datei: %s" % image_path)
+        log("BIN-Pruefung: %s" % crc_msg)
+        if not crc_ok:
+            raise RuntimeError("BIN-Datei ist nicht plausibel/CRC ist nicht OK. Schreibvorgang abgebrochen.")
+
+        log("Treiber wird geladen ...")
+        drv = open_driver(cfg["driver"], cfg["dll"], log)
+
+        name, base = detect_platform(drv, cfg["platform"], cfg["base"])
+        log("Plattform: %s" % name.upper())
+
+        if cfg["base"] is None and name == "amd":
+            bases = []
+            for b in (base, 0x0B00, 0x0B20):
+                if b and b not in bases:
+                    bases.append(b)
+        else:
+            bases = [base]
+
+        smbus = None
+        used_base = None
+        for b in bases:
+            test = SMBus(drv, b)
+            if dimm_present(test, addr):
+                smbus = test
+                used_base = b
+                break
+            if len(bases) > 1:
+                log("  kein DIMM @ SMBus-Basis 0x%04X / Adresse 0x%02X" % (b, addr))
+
+        if smbus is None:
+            raise RuntimeError("Kein DIMM an Adresse 0x%02X gefunden." % addr)
+
+        log("SMBus-Basis: 0x%04X" % used_base)
+        log("Ziel-DIMM : 0x%02X" % addr)
+        log("")
+        log("Pflicht-Backup vor dem Schreiben wird angelegt ...")
+
+        before1 = read_spd(smbus, addr, log)
+        before2 = read_spd(smbus, addr, None)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(cfg["out"], "BACKUP_BEFORE_WRITE_0x%02X_%s.bin" % (addr, stamp))
+        with open(backup_path, "wb") as f:
+            f.write(before1)
+        log("  Backup gespeichert: %s" % backup_path)
+
+        if before1 != before2:
+            backup2_path = os.path.join(cfg["out"], "BACKUP_BEFORE_WRITE_0x%02X_%s_secondread.bin" % (addr, stamp))
+            with open(backup2_path, "wb") as f:
+                f.write(before2)
+            raise RuntimeError("Backup-Doppelread ist nicht identisch. Schreiben aus Sicherheitsgruenden abgebrochen. Zweites Backup: %s" % backup2_path)
+
+        if before1[2] != 0x0C:
+            raise RuntimeError("Aktueller SPD-Inhalt meldet kein DDR4 (Byte 2 = 0x%02X). Schreiben abgebrochen." % before1[2])
+
+        backup_crc_ok, backup_crc_msg = ddr4_crc_status(before1)
+        log("  Backup-Pruefung: %s" % backup_crc_msg)
+
+        if before1 == image:
+            log("Die BIN ist bereits identisch mit dem aktuellen SPD-Inhalt. Es wurde nichts geschrieben.")
+            return
+
+        log("")
+        log("SCHREIBVORGANG STARTET. Stromversorgung nicht unterbrechen.")
+        written, skipped = write_spd_image(smbus, addr, image, log)
+        log("Schreiben beendet: %d Byte geschrieben, %d Byte unveraendert." % (written, skipped))
+
+        log("Lese zur Abschlusspruefung erneut 512 Byte ...")
+        after = read_spd(smbus, addr, log)
+        after_path = os.path.join(cfg["out"], "VERIFY_AFTER_WRITE_0x%02X_%s.bin" % (addr, stamp))
+        with open(after_path, "wb") as f:
+            f.write(after)
+        log("  Verify-Dump gespeichert: %s" % after_path)
+
+        if after != image:
+            mismatches = [i for i, (a, b) in enumerate(zip(after, image)) if a != b]
+            first = mismatches[0] if mismatches else -1
+            raise RuntimeError("Abschluss-Verify FEHLGESCHLAGEN: %d Byte(s) abweichend, erste Abweichung bei 0x%03X. Backup-Datei aufbewahren!" % (len(mismatches), first))
+
+        log("Abschluss-Verify OK: EEPROM-Inhalt entspricht der BIN-Datei.")
+        log("FERTIG.")
+    except Exception as e:
+        log("FEHLER: %s" % e)
+    finally:
+        if drv is not None:
+            drv.close()
+        done_cb()
+
+
 # ==========================================================================
 #  GUI
 # ==========================================================================
@@ -877,8 +1085,11 @@ class App:
         btnf.pack(fill="x", **pad)
         ttk.Checkbutton(btnf, text="Decode erzeugen",
                         variable=self.decode).pack(side="left")
+        self.btn_write = ttk.Button(btnf, text="BIN auf SPD schreiben ...",
+                                    command=self._write_bin)
+        self.btn_write.pack(side="right")
         self.btn_run = ttk.Button(btnf, text="Scan & Dump", command=self._start)
-        self.btn_run.pack(side="right")
+        self.btn_run.pack(side="right", padx=4)
         ttk.Button(btnf, text="Log speichern",
                    command=self._save_log).pack(side="right", padx=4)
         ttk.Button(btnf, text="Log leeren", command=self._clear_log).pack(side="right")
@@ -1020,32 +1231,92 @@ class App:
             pass
         self.root.after(80, self._poll_log)
 
-    def _start(self):
-        if self.running:
-            return
+    def _parse_common_cfg(self, require_addr=False):
         try:
             base = int(self.base.get(), 0) if self.base.get().strip() else None
         except ValueError:
             messagebox.showerror("Fehler", "SMBus-Basis ungueltig (z.B. 0x0B00).")
-            return
+            return None
         try:
             addr = int(self.addr.get(), 0) if self.addr.get().strip() else None
         except ValueError:
             messagebox.showerror("Fehler", "DIMM-Adresse ungueltig (z.B. 0x50).")
-            return
+            return None
+        if require_addr and addr is None:
+            messagebox.showerror("Fehler", "Zum Schreiben muss eine einzelne DIMM-Adresse eingetragen sein, z.B. 0x50.")
+            return None
+        if addr is not None and not (0x50 <= addr <= 0x57):
+            messagebox.showerror("Fehler", "DIMM-Adresse muss zwischen 0x50 und 0x57 liegen.")
+            return None
         out = self.outdir.get().strip() or os.getcwd()
         try:
             os.makedirs(out, exist_ok=True)
         except OSError as e:
             messagebox.showerror("Fehler", "Zielordner: %s" % e)
+            return None
+        return {"driver": self.driver.get(), "platform": self.platform.get(),
+                "base": base, "addr": addr, "out": out,
+                "dll": self.dll.get().strip(), "decode": self.decode.get()}
+
+    def _write_bin(self):
+        if self.running:
+            return
+        cfg = self._parse_common_cfg(require_addr=True)
+        if cfg is None:
             return
 
-        cfg = {"driver": self.driver.get(), "platform": self.platform.get(),
-               "base": base, "addr": addr, "out": out,
-               "dll": self.dll.get().strip(), "decode": self.decode.get()}
+        bin_path = filedialog.askopenfilename(
+            title="512-Byte DDR4-SPD-BIN zum Schreiben waehlen",
+            filetypes=[("SPD BIN", "*.bin"), ("Alle Dateien", "*.*")])
+        if not bin_path:
+            return
+
+        try:
+            with open(bin_path, "rb") as f:
+                image = f.read()
+            crc_ok, crc_msg = ddr4_crc_status(image)
+        except Exception as e:
+            messagebox.showerror("Fehler", "BIN-Datei kann nicht gelesen werden:\n%s" % e)
+            return
+
+        if not crc_ok:
+            messagebox.showerror(
+                "BIN-Pruefung fehlgeschlagen",
+                "Die Datei wird nicht geschrieben.\n\n%s" % crc_msg)
+            return
+
+        warn = (WRITE_WARNING + "\n\n"
+                "Ziel-DIMM-Adresse: 0x%02X\n"
+                "BIN-Datei: %s\n\n"
+                "Vor dem Schreiben wird zwingend ein Backup-Dump angelegt und verifiziert.\n\n"
+                "Mit 'Ja' bestaetigst du, dass du das Risiko verstanden hast und den Schreibvorgang auf eigene Gefahr startest." %
+                (cfg["addr"], bin_path))
+        if not messagebox.askyesno(
+                "Warnung: SPD schreiben",
+                warn,
+                icon="warning", default="no", parent=self.root):
+            self._append("\nSchreibvorgang abgebrochen: Warnung nicht bestaetigt.\n")
+            return
+
+        cfg["write_file"] = bin_path
+        self.running = True
+        self.btn_run.configure(state="disabled")
+        self.btn_write.configure(state="disabled")
+        self.status.set("Schreibt ...")
+        self._append("\n=== SPD-SCHREIBVORGANG gestartet ===\n")
+        threading.Thread(target=write_worker, args=(cfg, self.logq, self._done),
+                         daemon=True).start()
+
+    def _start(self):
+        if self.running:
+            return
+        cfg = self._parse_common_cfg(require_addr=False)
+        if cfg is None:
+            return
 
         self.running = True
         self.btn_run.configure(state="disabled")
+        self.btn_write.configure(state="disabled")
         self.status.set("Laeuft ...")
         self._append("\n=== Scan gestartet ===\n")
         threading.Thread(target=dump_worker, args=(cfg, self.logq, self._done),
@@ -1057,6 +1328,7 @@ class App:
     def _finish(self):
         self.running = False
         self.btn_run.configure(state="normal")
+        self.btn_write.configure(state="normal")
         self.status.set("Bereit")
 
 

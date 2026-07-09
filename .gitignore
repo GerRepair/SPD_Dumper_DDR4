@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+build/
+dist/
+*.spec
+
+*.log
+*.tmp
+
+# Dumps / private hardware data
+*.bin
+spd_dimm_*.txt
+SpdDumps/
+
+# Third-party binaries: prefer release ZIPs instead of source repo
+*.exe
+*.dll
+*.sys
