@@ -115,75 +115,7 @@ Recommended workflow:
 
 Only write SPD data if you know what you are doing. If the module does not boot after writing bad data, you may need an external EEPROM programmer / hardware flasher to recover it.
 
----
 
-## XMP Editing
-
-A separate XMP OC tool can be used to adjust XMP profile values in a saved SPD `.bin` file.
-
-The recommended workflow is:
-
-1. Dump SPD with this tool.
-2. Open the dump in the XMP OC tool.
-3. Make small and reasonable changes.
-4. Save as a new patched `.bin` file.
-5. Write the patched `.bin` only after keeping a safe backup.
-
-Do not jump from a low-speed profile to unrealistic high-speed values. A DDR4-2400 module will usually not run with aggressive DDR4-3600 values.
-
----
-
-## Building from Source
-
-Install Python 3 on the build machine and run:
-
-```bat
-build_exe_GerRepair.bat
-```
-
-The compiled executable will be created in the `dist` folder.
-
-For normal users, using the prebuilt release ZIP is recommended.
-
----
-
-## Project Structure
-
-```text
-SPD_Dumper_DDR4/
-├─ SPD_Read_GerRepair_Alpha.py
-├─ build_exe_GerRepair.bat
-├─ GerRepair_logo.png
-├─ GerRepair_icon.ico
-├─ licenses/
-│  └─ LICENSE-InpOutx64.txt
-├─ LICENSE
-└─ README.md
-```
-
----
-
-## Safety Notes
-
-- Always create a backup before writing.
-- Never write random SPD files from the internet.
-- Do not write SPD data made for a different RAM module unless you fully understand the differences.
-- Close monitoring and RGB software before reading or writing.
-- Use a UPS or stable power when writing EEPROM data.
-- Keep a hardware flasher available if you plan to experiment heavily.
-
----
-
-## Known Limitations
-
-- Alpha software, bugs are expected.
-- Focused on DDR4 SPD EEPROMs.
-- DDR5 SPD hubs are not the primary target.
-- Some AMD systems may require special SMBus access handling.
-- Some systems may block low-level drivers.
-- XMP edits do not guarantee memory stability.
-
----
 
 ## Third-Party Components
 
